@@ -1,0 +1,5 @@
+# 自动处理文本文件的换行符（提交时转为 LF，检出时适应本地系统）
+* text=auto
+
+# 明确指定 Markdown 文件必须使用 LF 换行（推荐做法，避免 Windows 下的诡异问题）
+*.md text eol=lf
