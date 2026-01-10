@@ -7,23 +7,35 @@ from config import CHUNK_SIZE, CHUNK_OVERLAP
 
 class DocumentProcessor:
     def __init__(self):
+        # 优化切分逻辑：
+        # 1. 优先按段落切
+        # 2. 中文标点
+        # 3. 英文标点 (注意 . 后面带空格，避免切断 3.14 这种数字)
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", "。", "！", "？", ".", " ", ""]
+            separators=[
+                "\n\n", "\n",
+                "。", "！", "？",
+                ". ", "! ", "? ",
+                " ", ""
+            ]
         )
 
     def load_pdf(self, file_path: str) -> str:
         doc = fitz.open(file_path)
-        text = ""
+        text = []
         for page in doc:
-            text += page.get_text()
+            # 获取文本并去除过多空白，但保留段落感
+            t = page.get_text()
+            if t.strip():
+                text.append(t)
         doc.close()
-        return text
+        return "\n\n".join(text)
 
     def load_docx(self, file_path: str) -> str:
         doc = Document(file_path)
-        return "\n".join([para.text for para in doc.paragraphs])
+        return "\n\n".join([para.text for para in doc.paragraphs if para.text.strip()])
 
     def load_markdown(self, file_path: str) -> str:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -50,12 +62,16 @@ class DocumentProcessor:
 
             documents = []
             for i, chunk in enumerate(chunks):
+                # 过滤掉过短的碎片（例如页码、页眉）
+                if len(chunk.strip()) < 20:
+                    continue
+
                 doc = LangchainDoc(
                     page_content=chunk,
                     metadata={
                         "source": filename,
                         "subject": subject,
-                        "chunk_id": int(i)  # 强制整型，便于排序
+                        "chunk_id": int(i)  # 强制转为整数
                     }
                 )
                 documents.append(doc)
