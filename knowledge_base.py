@@ -1,77 +1,80 @@
 import os
 import time
 import random
-# 优先尝试导入新的 HuggingFace 库，如果不存在则使用 community
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings
-except ImportError:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-
+import gc  # 引入垃圾回收
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
-from config import CHROMA_DIR, EMBEDDING_MODEL, OLLAMA_BASE_URL
+from config import CHROMA_DIR, EMBEDDING_MODEL, OLLAMA_BASE_URL, EMBEDDING_BATCH_SIZE
 from document_processor import DocumentProcessor
 
 class KnowledgeBase:
     def __init__(self):
-        # === 修复核心 1：通过环境变量配置 Ollama ===
-        # LangChain 的 OllamaEmbeddings 会自动读取这些环境变量
-        # 这样可以绕过构造函数的参数验证错误
+        # 【核心修复：连接报错】
+        # 不在构造函数传 base_url，而是直接设置环境变量
+        # LangChain 底层会自动读取这些变量，绕过 Pydantic 的参数校验错误
         os.environ['OLLAMA_BASE_URL'] = OLLAMA_BASE_URL
         os.environ['OLLAMA_HOST'] = OLLAMA_BASE_URL
 
         try:
-            print(f"🔌 正在连接 Ollama ({OLLAMA_BASE_URL})...")
-            # === 修复核心 2：初始化时不传 extra args ===
-            self.embeddings = OllamaEmbeddings(
-                model=EMBEDDING_MODEL
-            )
-            # 简单的冒烟测试，确保服务真的通了
+            # 仅传递 model，其他配置全靠环境变量
+            self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+            # 冒烟测试：尝试 Embedding 一个单词
             self.embeddings.embed_query("test")
-            print("✅ Ollama Embedding 服务连接成功")
-
         except Exception as e:
-            print(f"❌ Ollama 连接失败: {e}")
-            print("💡 请检查：1. Ollama 是否已启动 (ollama serve)？ 2. 模型是否已下载 (ollama pull nomic-embed-text)？")
-
-            # === 修复核心 3：不再自动 fallback 到 HuggingFace ===
-            # 因为国内网络通常连不上 HF，自动下载会导致长时间卡死
-            # 直接抛出异常，让用户先去修好 Ollama
-            raise RuntimeError("无法连接到本地 Ollama Embedding 服务，且无法连接 HuggingFace。请优先确保 Ollama 正常运行。")
+            print(f"Embedding 初始化失败: {e}")
+            raise RuntimeError(f"无法连接 Ollama ({OLLAMA_BASE_URL})。请检查：1. ollama serve 是否运行 2. 是否已 pull nomic-embed-text")
 
         self.processor = DocumentProcessor()
-        # 初始化向量库
+        # 版本号升级 v8，避免旧数据结构冲突
         self.vectorstore = Chroma(
             persist_directory=CHROMA_DIR,
             embedding_function=self.embeddings,
-            collection_name="feynman_knowledge_v3"
+            collection_name="feynman_knowledge_v8"
         )
 
-    def add_document(self, file_path: str, subject: str = "默认") -> int:
+    def add_document(self, file_path: str, subject: str = "默认"):
+        """
+        生成器函数：逐步处理文档并 yield 进度
+        Yields: (progress_float, total_docs, status_msg)
+        Returns: (total_count, preview_text)
+        """
+        yield 0.0, 0, "正在读取并切分文档..."
+
         documents = self.processor.process_document(file_path, subject)
         if not documents:
-            return 0
+            return 0, ""
 
-        # 分批次插入，防止爆显存
-        BATCH_SIZE = 10
-        total_batches = (len(documents) + BATCH_SIZE - 1) // BATCH_SIZE
+        total_docs = len(documents)
 
-        print(f"正在导入 {len(documents)} 个知识块，分 {total_batches} 批处理...")
+        # 提取预览文本（用于摘要），严格限制长度防止 LLM 溢出
+        preview_text = "\n".join([d.page_content for d in documents[:3]])[:2000]
 
-        success_count = 0
-        for i in range(0, len(documents), BATCH_SIZE):
-            batch = documents[i : i + BATCH_SIZE]
+        # 分批处理，防止爆显存
+        for i in range(0, total_docs, EMBEDDING_BATCH_SIZE):
+            batch = documents[i : i + EMBEDDING_BATCH_SIZE]
+
             try:
                 self.vectorstore.add_documents(batch)
-                success_count += len(batch)
-                print(f"进度: {min(i + BATCH_SIZE, len(documents))}/{len(documents)}")
-                # 稍微暂停，给显卡喘息时间
-                time.sleep(0.1)
+
+                # 【显存保护】强制垃圾回收
+                gc.collect()
+
+                # 计算进度
+                current_count = min(i + EMBEDDING_BATCH_SIZE, total_docs)
+                progress = current_count / total_docs
+                yield progress, total_docs, f"正在向量化: {current_count}/{total_docs}"
+
+                # 显卡冷却时间，防止过热降频
+                time.sleep(0.05)
+
             except Exception as e:
-                print(f"❌ 批次 {i//BATCH_SIZE + 1} 导入失败: {e}")
+                print(f"⚠️ Batch {i} 失败: {e}")
+                # 不抛出异常，继续处理下一批，保证大部分数据可用
+                yield progress, total_docs, f"⚠️ 批次 {i} 出错，跳过..."
 
-        return success_count
+        return total_docs, preview_text
 
+    # --- 标准查询方法 (保持 V2.0 逻辑) ---
     def get_all_subjects(self) -> list:
         try:
             data = self.vectorstore.get()
@@ -80,139 +83,38 @@ class KnowledgeBase:
                 if metadata and 'subject' in metadata:
                     subjects.add(metadata['subject'])
             return sorted(list(subjects))
-        except:
-            return []
+        except: return []
 
     def get_course_structure(self, subject: str) -> dict:
         collection = self.vectorstore._collection
+        where = {"subject": subject} if subject else None
         try:
-            results = collection.get(
-                where={"subject": subject},
-                include=['metadatas', 'documents']
-            )
-        except Exception as e:
-            print(f"数据库读取错误: {e}")
-            return {"subject": subject, "total_chunks": 0, "chapters": []}
+            results = collection.get(where=where, include=['metadatas', 'documents'])
+        except: return {}
 
-        if not results['ids']:
-            return {"subject": subject, "total_chunks": 0, "chapters": []}
-
-        # 清洗数据
-        valid_items = []
-        ids = results['ids']
-        metas = results['metadatas']
-        docs = results['documents']
-
-        for i in range(len(ids)):
-            if not metas[i] or not docs[i]:
-                continue
-            valid_items.append((ids[i], metas[i], docs[i]))
-
-        # 排序
-        valid_items.sort(key=lambda x: x[1].get('chunk_id', 0))
-
-        chapters = {}
-        for pid, meta, doc in valid_items:
-            source = meta.get('source', '未知章节')
-            if source not in chapters:
-                chapters[source] = {
-                    "chapter_id": len(chapters),
-                    "title": source.replace('.pdf', '').replace('.docx', '').replace('.md', ''),
-                    "source": source,
-                    "chunks": []
-                }
-
-            chapters[source]["chunks"].append({
-                "id": pid,
-                "chunk_id": meta.get('chunk_id', 0),
-                "preview": doc[:80].replace('\n', ' ') + "...",
-                "content": doc,
-                "metadata": meta
-            })
-
-        return {
-            "subject": subject,
-            "total_chunks": len(valid_items),
-            "chapters": list(chapters.values())
-        }
-
-    def get_chapter_progress(self, subject: str, tracker) -> list:
-        structure = self.get_course_structure(subject)
-        progress_data = tracker.get_subject_progress(subject)
-        progress_map = {p['knowledge_id']: p for p in progress_data}
-
-        for chapter in structure['chapters']:
-            completed = 0
-            mastered = 0
-            for chunk in chapter['chunks']:
-                kid = chunk['id']
-                if kid in progress_map:
-                    chunk['progress'] = progress_map[kid]
-                    completed += 1
-                    if progress_map[kid]['mastery_level'] >= 0.8:
-                        mastered += 1
-                else:
-                    chunk['progress'] = None
-
-            chapter['stats'] = {
-                'total': len(chapter['chunks']),
-                'completed': completed,
-                'mastered': mastered,
-                'progress_pct': round(completed / len(chapter['chunks']) * 100) if chapter['chunks'] else 0
-            }
+        structure = {}
+        if results['ids']:
+            for i, meta in enumerate(results['metadatas']):
+                src = meta.get('source', '未知来源')
+                if src not in structure: structure[src] = []
+                structure[src].append({
+                    "id": results['ids'][i],
+                    "chunk_id": meta.get('chunk_id', 0),
+                    "preview": results['documents'][i][:60].replace('\n', ' ') + "..."
+                })
+        for src in structure: structure[src].sort(key=lambda x: x['chunk_id'])
         return structure
 
     def get_knowledge_by_id(self, k_id: str) -> dict:
-        collection = self.vectorstore._collection
-        results = collection.get(ids=[k_id], include=['metadatas', 'documents'])
-        if results['ids']:
-            return {
-                "content": results['documents'][0],
-                "metadata": results['metadatas'][0],
-                "id": results['ids'][0]
-            }
+        res = self.vectorstore.get(ids=[k_id], include=['metadatas', 'documents'])
+        if res['ids']:
+            return {"id": res['ids'][0], "metadata": res['metadatas'][0], "content": res['documents'][0]}
         return None
-
-    def get_next_unlearned(self, subject: str, tracker) -> dict:
-        structure = self.get_course_structure(subject)
-        learned_ids = set(tracker.get_learned_ids(subject))
-
-        for chapter in structure['chapters']:
-            for chunk in chapter['chunks']:
-                if chunk['id'] not in learned_ids:
-                    return {
-                        "content": chunk['content'],
-                        "metadata": chunk['metadata'],
-                        "id": chunk['id'],
-                        "chapter": chapter['title'],
-                        "position": f"第{chapter['chapter_id']+1}章 - 第{chunk['chunk_id']+1}节"
-                    }
-        return None
-
-    def get_weak_points(self, subject: str, tracker, limit: int = 5) -> list:
-        weak_ids = tracker.get_weak_knowledge(subject, limit)
-        result = []
-        for kid, score in weak_ids:
-            k = self.get_knowledge_by_id(kid)
-            if k:
-                k['last_score'] = score
-                result.append(k)
-        return result
 
     def get_random_knowledge(self, subject: str = None) -> dict:
-        try:
-            collection = self.vectorstore._collection
-            where_filter = {"subject": subject} if subject else None
-            results = collection.get(where=where_filter, include=['metadatas', 'documents'])
-
-            if not results['ids']:
-                return None
-
-            idx = random.randint(0, len(results['ids']) - 1)
-            return {
-                "content": results['documents'][idx],
-                "metadata": results['metadatas'][idx],
-                "id": results['ids'][idx]
-            }
-        except:
-            return None
+        collection = self.vectorstore._collection
+        where = {"subject": subject} if subject and subject != "全部" else None
+        results = collection.get(where=where, include=['metadatas', 'documents'])
+        if not results['ids']: return None
+        idx = random.randint(0, len(results['ids']) - 1)
+        return {"content": results['documents'][idx], "metadata": results['metadatas'][idx], "id": results['ids'][idx]}

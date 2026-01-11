@@ -1,155 +1,156 @@
 import streamlit as st
-import pandas as pd
 import os
-from document_processor import DocumentProcessor
+import pandas as pd
 from knowledge_base import KnowledgeBase
 from feynman_engine import FeynmanEngine
 from progress_tracker import ProgressTracker
-from config import DOCUMENTS_DIR, MASTERY_LEVELS, LEARNING_MODES
+from config import DOCUMENTS_DIR
 
-st.set_page_config(page_title="费曼 AI 导师", page_icon="🎓", layout="wide")
-
-# CSS 样式
-st.markdown("""
-<style>
-    .stProgress > div > div > div > div { background-color: #4CAF50; }
-    .mastery-card {
-        padding: 15px; border-radius: 10px; text-align: center; color: white; margin-bottom: 10px;
-    }
-    .key-point-pass { color: #4CAF50; font-weight: bold; }
-    .key-point-fail { color: #FF5252; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="费曼 AI 专家版", page_icon="🎓", layout="wide")
+st.markdown("""<style>.stButton>button {width: 100%;} .info-card {padding:15px; background-color:#f0f2f6; border-radius:10px; margin-bottom:15px;} .tag {background-color:#e0e0e0; padding:2px 8px; border-radius:4px; font-size:0.8em;}</style>""", unsafe_allow_html=True)
 
 @st.cache_resource
 def get_core():
-    return {
-        'kb': KnowledgeBase(),
-        'engine': FeynmanEngine(),
-        'tracker': ProgressTracker()
-    }
+    # 延迟加载，防止启动时报错
+    return {'kb': KnowledgeBase(), 'engine': FeynmanEngine(), 'tracker': ProgressTracker()}
 
 try:
     core = get_core()
 except Exception as e:
-    st.error(f"核心组件初始化失败: {e}")
+    st.error(f"⚠️ 系统启动失败: {e}")
     st.stop()
 
-# 侧边栏
+# 状态初始化
+if 'page' not in st.session_state: st.session_state.page = "dashboard"
+if 'current_subject' not in st.session_state: st.session_state.current_subject = "全部"
+if 'study_session' not in st.session_state: st.session_state.study_session = None
+if 'eval_result' not in st.session_state: st.session_state.eval_result = None
+if 'target_id' not in st.session_state: st.session_state.target_id = None
+
+# SPA 路由函数
+def navigate_to(page_name):
+    st.session_state.page = page_name
+    st.rerun()
+
 with st.sidebar:
-    st.title("🎓 费曼 AI 导师")
-    all_subjects = core['kb'].get_all_subjects()
-    current_subject = st.selectbox("📚 当前课程", all_subjects) if all_subjects else "默认"
+    st.title("🎓 费曼 AI")
+    if st.button("📊 学习概览", type="primary" if st.session_state.page=="dashboard" else "secondary"): navigate_to("dashboard")
+    if st.button("🗺️ 知识地图", type="primary" if st.session_state.page=="map" else "secondary"): navigate_to("map")
+    if st.button("✍️ 开始学习", type="primary" if st.session_state.page=="study" else "secondary"):
+        if st.session_state.page != "study": navigate_to("study")
+    if st.button("📂 导入资料", type="primary" if st.session_state.page=="import" else "secondary"): navigate_to("import")
     st.divider()
-    page = st.radio("导航", ["🗺️ 课程地图", "✍️ 开始学习", "📊 数据看板", "📂 资料导入"])
+    st.session_state.current_subject = st.selectbox("📚 专注学科", ["全部"] + core['kb'].get_all_subjects())
 
-# 1. 课程地图
-if page == "🗺️ 课程地图":
-    st.header(f"🗺️ 学习路径：{current_subject}")
-    course_data = core['kb'].get_chapter_progress(current_subject, core['tracker'])
+# ========== 页面：导入资料 (带生成器进度条) ==========
+if st.session_state.page == "import":
+    st.header("📂 导入与分析")
+    uploaded_file = st.file_uploader("支持 PDF/Word/MD", type=['pdf', 'docx', 'md', 'txt'])
+    subject_input = st.text_input("学科分类", value="通用")
 
-    if not course_data['chapters']:
-        st.info("👈 该课程暂无内容，请去「资料导入」页面上传文档")
+    if uploaded_file and st.button("🚀 智能导入"):
+        save_path = os.path.join(DOCUMENTS_DIR, uploaded_file.name)
+        with open(save_path, "wb") as f: f.write(uploaded_file.getbuffer())
 
-    for chapter in course_data['chapters']:
-        with st.expander(f"📖 {chapter['title']} ({chapter['stats']['completed']}/{chapter['stats']['total']})", expanded=True):
-            st.progress(chapter['stats']['progress_pct'] / 100)
-            for chunk in chapter['chunks']:
-                c1, c2, c3 = st.columns([0.1, 0.7, 0.2])
-                score = chunk['progress']['last_score'] if chunk['progress'] else 0
-                status = "🟢" if score >= 0.9 else "🟡" if score >= 0.6 else "🔴" if chunk['progress'] else "⚪"
+        # 进度条容器
+        progress_bar = st.progress(0, text="初始化中...")
 
-                with c1: st.text(status)
-                with c2: st.caption(chunk['preview'])
-                with c3:
-                    if st.button("学习", key=f"btn_{chunk['id']}"):
+        try:
+            # 调用生成器
+            generator = core['kb'].add_document(save_path, subject_input)
+
+            total_count = 0
+            preview_text = ""
+
+            # 消费生成器
+            for result in generator:
+                if len(result) == 3: # 进度更新
+                    prog, total, msg = result
+                    progress_bar.progress(prog, text=msg)
+                else: # 最终结果
+                    total_count, preview_text = result
+
+            progress_bar.progress(1.0, text="✅ 向量化完成！正在进行 AI 分析...")
+
+            # AI 分析
+            analysis = core['engine'].analyze_file_content(preview_text)
+            core['tracker'].save_file_metadata(uploaded_file.name, analysis.get('domain'), analysis.get('summary'))
+
+            st.success(f"成功导入 {total_count} 个知识块！")
+            st.markdown(f"<div class='info-card'><b>识别领域：</b>{analysis.get('domain')}<br><b>摘要：</b>{analysis.get('summary')}</div>", unsafe_allow_html=True)
+
+        except Exception as e:
+            st.error(f"导入出错: {e}")
+
+# ========== 页面：知识地图 ==========
+elif st.session_state.page == "map":
+    st.header(f"🗺️ 知识地图 ({st.session_state.current_subject})")
+    subj = st.session_state.current_subject if st.session_state.current_subject != "全部" else None
+    if not subj: st.warning("请选择具体学科")
+    else:
+        structure = core['kb'].get_course_structure(subj)
+        if not structure: st.info("暂无数据")
+        for filename, chunks in structure.items():
+            meta = core['tracker'].get_file_metadata(filename)
+            with st.expander(f"📄 {filename} - [{meta['domain']}]"):
+                st.caption(meta['summary'])
+                for chunk in chunks:
+                    c1, c2 = st.columns([0.8, 0.2])
+                    c1.text(f"片段 {chunk['chunk_id']}: {chunk['preview']}")
+                    if c2.button("去学习", key=f"btn_{chunk['id']}"):
                         st.session_state.target_id = chunk['id']
-                        st.switch_page("app.py") # 注意：本地运行可能需要改为 st.rerun() 或提示用户切换Tab
-                        # 如果 switch_page 报错，可以用 st.info("请切换到「✍️ 开始学习」页面，已自动选中")
+                        st.session_state.study_session = None
+                        st.session_state.eval_result = None
+                        navigate_to("study")
 
-# 2. 开始学习
-elif page == "✍️ 开始学习":
+# ========== 页面：学习模式 ==========
+elif st.session_state.page == "study":
     st.header("✍️ 费曼深度学习")
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        mode_key = st.selectbox("选择模式", list(LEARNING_MODES.keys()), format_func=lambda x: LEARNING_MODES[x])
-    with c2:
-        if st.button("🚀 下一题", type="primary"):
-            st.session_state.study_data = None
+    if st.session_state.study_session is None:
+        target = st.session_state.target_id
+        subj = st.session_state.current_subject
+        with st.spinner("🧠 专家出题中..."):
+            res = core['engine'].study_session(subject=subj, specific_id=target)
+            if "error" in res: st.error(res['error'])
+            else:
+                st.session_state.study_session = res
+                st.session_state.target_id = None
+                st.rerun()
+
+    if st.session_state.study_session:
+        data = st.session_state.study_session
+        st.markdown(f"<div class='info-card'><span class='tag'>模式: {data['mode']}</span> <span class='tag'>领域: {data['domain']}</span> <span class='tag' style='background:#d4edda;color:#155724'>🎯 {data['topic_tag']}</span></div>", unsafe_allow_html=True)
+        st.subheader(f"Q: {data['question']}")
+        with st.expander("🔍 查看原文"): st.info(data['knowledge']['content'])
+        user_input = st.text_area("你的解释:", height=200)
+        c1, c2 = st.columns([1, 1])
+        if c1.button("提交评估", type="primary"):
+            if not user_input: st.warning("请先输入")
+            else:
+                with st.spinner("批改中..."):
+                    res = core['engine'].submit_explanation(data['knowledge'], user_input, data['domain'])
+                    st.session_state.eval_result = res
+        if c2.button("下一题"):
+            st.session_state.study_session = None
             st.session_state.eval_result = None
             st.rerun()
-
-    if 'study_data' not in st.session_state: st.session_state.study_data = None
-    if 'eval_result' not in st.session_state: st.session_state.eval_result = None
-
-    # 获取题目
-    if not st.session_state.study_data:
-        target_id = st.session_state.get('target_id')
-        if target_id:
-            res = core['engine'].study_session(current_subject, mode="specific", specific_id=target_id)
-            st.session_state.target_id = None
-        else:
-            res = core['engine'].study_session(current_subject, mode=mode_key)
-
-        if "error" in res:
-            st.error(res['error'])
-        else:
-            st.session_state.study_data = res
-            st.rerun()
-
-    if st.session_state.study_data:
-        data = st.session_state.study_data
-        st.caption(f"模式: {data.get('mode')} | {data.get('position_info', '')}")
-        st.markdown(f"### Q: {data['question']}")
-
-        with st.expander("🔍 查看原文线索"):
-            st.info(data['knowledge']['content'])
-
-        user_input = st.text_area("你的解释:", height=150)
-
-        if st.button("提交评估") and user_input:
-            with st.spinner("AI 正在批改..."):
-                res = core['engine'].submit_explanation(data['knowledge'], user_input)
-                st.session_state.eval_result = res
 
         if st.session_state.eval_result:
             r = st.session_state.eval_result
             st.divider()
-            lvl = r.get('mastery_level', MASTERY_LEVELS['beginner'])
-            st.markdown(f"""
-            <div class="mastery-card" style="background-color: {lvl['color']};">
-                <h1>{int(r['overall_score']*100)}分 - {lvl['label']}</h1>
-                <p>{r.get('teacher_comment', '')}</p>
-            </div>
-            """, unsafe_allow_html=True)
+            score = r.get('overall_score', 0)
+            color = "#28a745" if score >= 0.8 else "#dc3545"
+            st.markdown(f"<h3 style='color:{color}'>得分: {int(score*100)}</h3>", unsafe_allow_html=True)
+            st.info(f"👨‍🏫 点评: {r.get('feedback')}")
+            st.success(f"💡 参考: {r.get('feynman_explanation')}")
 
-            # 关键点对照
-            st.subheader("🎯 关键点检查")
-            kp = r.get('key_points', {})
-            if kp.get('list'):
-                for point in kp['list']:
-                    icon = "✅" if point.get('matched') else "❌"
-                    color = "key-point-pass" if point.get('matched') else "key-point-fail"
-                    st.markdown(f"- {icon} <span class='{color}'>{point['point']}</span>", unsafe_allow_html=True)
-
-            with st.expander("📚 参考答案"):
-                st.write(r.get('ref_answer'))
-
-# 3. 数据看板
-elif page == "📊 数据看板":
+# ========== 页面：数据看板 ==========
+elif st.session_state.page == "dashboard":
+    st.header("📊 数据看板")
     stats = core['tracker'].get_statistics()
-    k1, k2 = st.columns(2)
-    k1.metric("总知识点", stats['total_knowledge'])
-    k2.metric("平均掌握度", f"{stats['avg_mastery']}%")
-
-# 4. 资料导入
-elif page == "📂 资料导入":
-    st.header("📚 导入文档")
-    f = st.file_uploader("支持 PDF/Docx/MD", type=['pdf', 'docx', 'md'])
-    sub = st.text_input("课程名称", value="未命名课程")
-    if f and st.button("导入"):
-        path = os.path.join(DOCUMENTS_DIR, f.name)
-        with open(path, "wb") as file: file.write(f.getbuffer())
-        with st.spinner("正在后台分批处理..."):
-            count = core['kb'].add_document(path, sub)
-            st.success(f"成功导入 {count} 个知识块！")
+    k1, k2, k3 = st.columns(3)
+    k1.metric("知识总量", stats['total_knowledge'])
+    k2.metric("已精通", stats.get('mastered_count', 0))
+    k3.metric("平均掌握", f"{stats['avg_mastery']}%")
+    if stats['by_subject']: st.bar_chart(pd.DataFrame(stats['by_subject']).set_index('subject')['total'])
+    else: st.info("暂无数据")

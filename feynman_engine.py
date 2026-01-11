@@ -1,187 +1,161 @@
 import json
 import re
+import os
 from langchain_ollama import OllamaLLM
 from langchain.prompts import PromptTemplate
-from config import LLM_MODEL, OLLAMA_BASE_URL, MASTERY_LEVELS
+from config import LLM_MODEL, OLLAMA_BASE_URL, OLLAMA_CONTEXT_WINDOW
 from knowledge_base import KnowledgeBase
 from progress_tracker import ProgressTracker
 
 class FeynmanEngine:
     def __init__(self):
+        os.environ['OLLAMA_BASE_URL'] = OLLAMA_BASE_URL
+        # LLM 对象通常支持 num_ctx 参数，直接设置以扩大上下文
         self.llm = OllamaLLM(
             model=LLM_MODEL,
-            temperature=0.3,
-            base_url=OLLAMA_BASE_URL,
+            temperature=0.4,
+            num_ctx=OLLAMA_CONTEXT_WINDOW
         )
         self.kb = KnowledgeBase()
         self.tracker = ProgressTracker()
 
     def _parse_llm_json(self, text: str) -> dict:
+        """鲁棒的 JSON 解析"""
         text = text.replace("```json", "").replace("```", "").strip()
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
+            match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
-                try:
-                    return json.loads(match.group())
-                except:
-                    pass
-        # 兜底返回，防止应用崩溃
-        return {
-            "overall_score": 0.5,
-            "dimensions": {"accuracy": 5, "clarity": 5, "completeness": 5, "examples": 5},
-            "key_points": {"list": []},
-            "teacher_comment": "解析评分失败，但这不影响你的学习记录。",
-            "ref_answer": "暂无标准答案"
-        }
+                try: return json.loads(match.group())
+                except: pass
+        return {}
 
-    def _get_mastery_level(self, score: float) -> dict:
-        for level_id, level_info in MASTERY_LEVELS.items():
-            if score >= level_info['min']:
-                return level_id, level_info
-        return "beginner", MASTERY_LEVELS['beginner']
+    def analyze_file_content(self, preview_text: str) -> dict:
+        """导入文件时分析领域和摘要"""
+        # 【防御性截断】确保不发生 Decode Error
+        safe_input = preview_text[:2500]
 
-    def extract_key_points(self, content: str) -> list:
         prompt = PromptTemplate(
             input_variables=["content"],
-            template="""从以下内容提取3-5个核心关键词或短语。
-内容：
-{content}
-
-请输出JSON格式：
-{{ "key_points": [{{"point": "关键词1", "importance": "high"}}] }}
-"""
-        )
-        try:
-            res = self.llm.invoke(prompt.format(content=content))
-            return self._parse_llm_json(res).get('key_points', [])
-        except:
-            return []
-
-    def generate_question(self, knowledge: dict) -> str:
-        # === 关键修复：增加语言自适应指令 ===
-        prompt = PromptTemplate(
-            input_variables=["content"],
-            template="""你是一位费曼学习法教练。请阅读以下知识片段：
+            template="""你是一位博学的图书管理员。请阅读以下文件片段：
 ---
 {content}
 ---
-请生成一个引导性问题。
+请提取以下信息并以JSON格式返回：
+1. "domain": 该内容属于哪个具体专业领域？（如：量子物理、中国历史、Python编程）
+2. "summary": 用一段话概括这份文档的核心教学内容（150字以内）。
 
-⚠️ 重要规则：
-1. **请始终用中文提问**
-2. 问题要像初学者问的，不要直接暴露定义。
-3. 直接输出问题本身
+输出JSON示例：
+{{ "domain": "领域名", "summary": "摘要内容" }}
 """
         )
         try:
-            return self.llm.invoke(prompt.format(content=knowledge["content"])).strip()
+            res = self.llm.invoke(prompt.format(content=safe_input))
+            return self._parse_llm_json(res)
         except Exception as e:
-            return f"请解释这段内容：{knowledge['content'][:50]}..."
+            print(f"Summary Error: {e}")
+            return {"domain": "通用知识", "summary": "自动摘要生成失败"}
 
-    def evaluate_explanation(self, knowledge: dict, user_explanation: str) -> dict:
+    def generate_question(self, knowledge: dict, domain: str = "通用") -> dict:
         prompt = PromptTemplate(
-            input_variables=["original", "explanation"],
-            template="""你是一位严格的导师。请对比原始知识和学生的解释。
+            input_variables=["domain", "content"],
+            template="""你是一位【{domain}】领域的资深专家导师。
+请阅读以下知识片段：
+---
+{content}
+---
+任务：
+1. 提取这段内容的一个核心“知识点标签”（Topic Tag）。
+2. 基于该知识点，向学生提出一个**概念性问题**。
+   - 必须用中文提问。
+   - 不要问“是什么”，要问“为什么”或“底层逻辑”。
 
-【原始知识】：
+请严格按JSON返回：
+{{
+    "topic_tag": "核心知识点",
+    "question": "你的专家级提问"
+}}
+"""
+        )
+        try:
+            res = self.llm.invoke(prompt.format(domain=domain, content=knowledge['content']))
+            parsed = self._parse_llm_json(res)
+            return {
+                "question": parsed.get("question", "请解释这段内容的核心概念。"),
+                "topic_tag": parsed.get("topic_tag", "知识点练习")
+            }
+        except:
+            return {
+                "question": f"请解释：{knowledge['content'][:50]}...",
+                "topic_tag": "随机练习"
+            }
+
+    def evaluate_explanation(self, knowledge: dict, user_explanation: str, domain: str) -> dict:
+        prompt = PromptTemplate(
+            input_variables=["domain", "original", "explanation"],
+            template="""你是一位【{domain}】领域的费曼学习法导师。
+
+【原始教材】：
 {original}
 
 【学生解释】：
 {explanation}
 
-请严格按以下 JSON 格式输出（只输出JSON）：
+请执行以下评估：
+1. **评分**：准确性、简单性、完整性。
+2. **费曼式参考解释**：
+   - 必须**基于【原始教材】**。
+   - 必须使用**生活中的类比**或**极简的语言**。
+
+请严格输出JSON：
 {{
-    "dimensions": {{
-        "accuracy": 0-10,
-        "clarity": 0-10,
-        "completeness": 0-10,
-        "examples": 0-10
-    }},
     "overall_score": 0.0-1.0,
-    "key_points": {{
-        "list": [
-            {{"point": "Key Concept 1", "matched": true, "student_said": "..."}},
-            {{"point": "Key Concept 2", "matched": false, "student_said": "N/A"}}
-        ]
-    }},
-    "teacher_comment": "简短点评（始终用中文点评）",
-    "ref_answer": "参考解释（与原始内容语言一致）"
+    "feedback": "简短点评（中文）",
+    "feynman_explanation": "你的类比式参考解释"
 }}"""
         )
-
         try:
-            res = self.llm.invoke(prompt.format(original=knowledge["content"], explanation=user_explanation))
-            eval_result = self._parse_llm_json(res)
-        except Exception as e:
-            print(f"Eval Error: {e}")
-            eval_result = self._parse_llm_json("{}")
+            res = self.llm.invoke(prompt.format(
+                domain=domain, original=knowledge['content'], explanation=user_explanation
+            ))
+            return self._parse_llm_json(res)
+        except:
+            return {"overall_score": 0.0, "feedback": "服务繁忙，无法评分", "feynman_explanation": "无"}
 
-        # 补全数据结构
-        score = eval_result.get('overall_score', 0.5)
-        _, level_info = self._get_mastery_level(score)
-        eval_result['mastery_level'] = level_info
-
-        dims = eval_result.get('dimensions', {})
-        eval_result['dimensions_pct'] = {k: v * 10 for k, v in dims.items()}
-
-        return eval_result
-
-    def study_session(self, subject: str = None, mode: str = "sequential", specific_id: str = None) -> dict:
-        knowledge = None
-        session_mode = mode
-        position_info = ""
-
-        # 逻辑同前，增加 try-except 保护
-        try:
-            if specific_id:
-                knowledge = self.kb.get_knowledge_by_id(specific_id)
-                session_mode = "精修"
-            elif mode == "review":
-                due = self.tracker.get_due_reviews(limit=1)
-                if due:
-                    kid, subj, preview, mastery = due[0]
-                    knowledge = self.kb.get_knowledge_by_id(kid)
-                    session_mode = "复习"
-            elif mode == "sequential":
-                knowledge = self.kb.get_next_unlearned(subject, self.tracker)
-                if knowledge:
-                    session_mode = "新学"
-                    position_info = knowledge.get('position', '')
-                else:
-                    knowledge = self.kb.get_random_knowledge(subject) # 兜底
-                    session_mode = "随机"
-            elif mode == "weak":
-                weak = self.kb.get_weak_points(subject, self.tracker, 1)
-                if weak: knowledge = weak[0]
-            elif mode == "random":
+    def study_session(self, subject: str = None, specific_id: str = None) -> dict:
+        if specific_id:
+            knowledge = self.kb.get_knowledge_by_id(specific_id)
+            mode = "定向精修"
+        else:
+            due = self.tracker.get_due_reviews(limit=1)
+            if due and (not subject or subject == "全部"):
+                kid, subj, _, _ = due[0]
+                knowledge = self.kb.get_knowledge_by_id(kid)
+                mode = "复习模式"
+            else:
                 knowledge = self.kb.get_random_knowledge(subject)
+                mode = "探索模式"
 
-            if not knowledge:
-                return {"error": "没有找到可学习的知识点，请检查是否有导入文档。"}
+        if not knowledge: return {"error": "暂无知识，请先导入文档。"}
 
-            question = self.generate_question(knowledge)
-            return {
-                "mode": session_mode,
-                "knowledge": knowledge,
-                "question": question,
-                "position_info": position_info,
-                "can_view_content": True
-            }
-        except Exception as e:
-            print(f"Session Error: {e}")
-            return {"error": f"系统繁忙，请重试: {str(e)}"}
+        # 获取元数据
+        source = knowledge.get('metadata', {}).get('source', '')
+        meta = self.tracker.get_file_metadata(source)
+        domain = meta.get('domain', '通用知识')
 
-    def submit_explanation(self, knowledge: dict, user_explanation: str) -> dict:
-        eval_res = self.evaluate_explanation(knowledge, user_explanation)
-        k_id = knowledge.get("id") or str(hash(knowledge["content"]))
+        gen_res = self.generate_question(knowledge, domain)
+        return {
+            "mode": mode, "knowledge": knowledge, "domain": domain,
+            "topic_tag": gen_res['topic_tag'], "question": gen_res['question']
+        }
+
+    def submit_explanation(self, knowledge: dict, user_explanation: str, domain: str) -> dict:
+        eval_res = self.evaluate_explanation(knowledge, user_explanation, domain)
+        k_id = knowledge.get('id')
         self.tracker.record_review(
-            k_id,
-            knowledge.get("metadata", {}).get("subject", "默认"),
-            knowledge["content"],
-            eval_res.get("overall_score", 0),
-            user_explanation,
-            eval_res.get("teacher_comment", ""),
+            k_id, knowledge.get('metadata', {}).get('subject', '默认'),
+            knowledge['content'], eval_res.get('overall_score', 0),
+            user_explanation, eval_res.get('feedback', '')
         )
         return eval_res
